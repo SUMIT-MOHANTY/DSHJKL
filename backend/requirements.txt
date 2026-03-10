@@ -1,0 +1,125 @@
+Django>=4.2,<5.0
+djangorestframework>=3.14.0
+psycopg2-binary>=2.9.0
+python-decouple>=3.8
+gunicorn>=21.0.0
+whitenoise>=6.5.0
+django-cors-headers>=4.0.0
+EOF
+
+# Fix 4: Create backend/.env.example
+[FIX 2] Creating backend/.env.example
+cat <<'EOF' > backend/.env.example
+DEBUG=True
+SECRET_KEY=REPLACE_WITH_RANDOM_SECRET
+DATABASE_URL=sqlite:///db.sqlite3
+ALLOWED_HOSTS=localhost,127.0.0.1
+CORS_ALLOWED_ORIGINS=http://localhost:3000
+EOF
+
+# Fix 5: Create backend/Dockerfile
+[FIX 3] Creating backend/Dockerfile
+cat <<'EOF' > backend/Dockerfile
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN python manage.py collectstatic --noinput
+
+EXPOSE 8000
+CMD ["gunicorn", "app.wsgi:application", "--bind", "0.0.0.0:8000"]
+EOF
+
+# Fix 6: Create frontend/Dockerfile
+[FIX 4] Creating frontend/Dockerfile
+cat <<'EOF' > frontend/Dockerfile
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+EOF
+
+# Fix 7: Create root docker-compose.yml
+[FIX 5] Creating docker-compose.yml
+cat <<'EOF' > docker-compose.yml
+version: '3.9'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=True
+      - DATABASE_URL=sqlite:///db.sqlite3
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+EOF
+
+# Fix 8: Create .gitignore
+[FIX 6] Creating .gitignore
+cat <<'EOF' > .gitignore
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node modules
+frontend/node_modules/
+npm-debug.log*
+
+# Django
+*.sqlite3
+*.pyc
+db.sqlite3
+media/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+EOF
+
+# Fix 9: Create basic README.md
+[FIX 7] Creating README.md
+cat <<'EOF' > README.md
+# Full-Stack Starter
+
+Production-ready starter with Django REST backend and Next.js frontend.
+
+## Quick Start
