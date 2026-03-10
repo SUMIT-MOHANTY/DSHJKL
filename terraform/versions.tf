@@ -1,0 +1,703 @@
+terraform {
+  required_version = ">= 1.6"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
+  }
+  backend "s3" {
+    bucket         = "CHANGEME-terraform-state"
+    key            = "captive-portal/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "CHANGEME-terraform-locks"
+  }
+}
+
+provider "aws" {
+  region  = var.region
+  profile = var.aws_profile
+}
+EOF
+
+# variables.tf
+cat <<'EOF' > terraform/variables.tf
+variable "region" { type = string; default = "us-east-1" }
+variable "azs" { type = list(string); default = ["us-east-1a", "us-east-1b"] }
+variable "aws_profile" { type = string; default = "CHANGEME" }
+variable "project" { type = string; default = "captive-portal" }
+variable "environment" { type = string; description = "staging or prod" }
+
+variable "cidr" { type = string; description = "VPC CIDR range" }
+variable "db_username" { type = string; default = "captive" }
+variable "app_port" { type = number; default = 8000 }
+EOF
+
+# VPC module
+cat <<'EOF' > terraform/vpc/main.tf
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block           = var.cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  tags = {
+    Name = "Environment-${var.env}-VPC"
+  }
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.project}-${var.env}-igw" }
+}
+
+resource "aws_subnet" "public" {
+  count                   = length(var.azs)
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(var.cidr, 4, count.index)
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = true
+  tags = { Name = "Environment-${var.env}-PublicSubnet${count.index + 1}" }
+}
+
+resource "aws_subnet" "private" {
+  count             = length(var.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.cidr, 4, count.index + 2)
+  availability_zone = var.azs[count.index]
+  tags = { Name = "Environment-${var.env}-PrivateSubnet${count.index + 1}" }
+}
+
+resource "aws_route_table" "internet" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+  tags = { Name = "${var.project}-${var.env}-public-rt" }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(aws_subnet.public)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.internet.id
+}
+
+resource "aws_security_group" "alb" {
+  name        = "${var.project}-${var.env}-alb"
+  vpc_id      = aws_vpc.main.id
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "ecs" {
+  name   = "${var.project}-${var.env}-ecs"
+  vpc_id = aws_vpc.main.id
+  ingress {
+    from_port       = 8000
+    to_port         = 8000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "rds" {
+  name   = "${var.project}-${var.env}-rds-sg"
+  vpc_id = aws_vpc.main.id
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs.id]
+  }
+}
+
+resource "aws_security_group" "redis" {
+  name   = "${var.project}-${var.env}-redis-sg"
+  vpc_id = aws_vpc.main.id
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs.id]
+  }
+}
+
+output "vpc_id" { value = aws_vpc.main.id }
+output "public_subnets" { value = aws_subnet.public[*].id }
+output "private_subnets" { value = aws_subnet.private[*].id }
+output "ecs_sg_id" { value = aws_security_group.ecs.id }
+output "rds_sg_id" { value = aws_security_group.rds.id }
+output "redis_sg_id" { value = aws_security_group.redis.id }
+output "alb_sg_id" { value = aws_security_group.alb.id }
+EOF
+
+cat <<'EOF' > terraform/vpc/variables.tf
+variable "project" {}
+variable "env" {}
+variable "cidr" {}
+variable "azs" { type = list(string) }
+EOF
+
+# RDS module
+cat <<'EOF' > terraform/rds/main.tf
+resource "random_password" "db" {
+  length  = 16
+  special = false
+}
+
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project}-${var.env}-db-subnet"
+  subnet_ids = var.subnet_ids
+}
+
+resource "aws_db_instance" "main" {
+  identifier     = "${var.project}-${var.env}-postgres"
+  engine         = "postgres"
+  engine_version = "15.4"
+  instance_class = "db.t3.micro"
+  allocated_storage = 20
+  db_name  = var.db_name
+  username = var.username
+  password = random_password.db.result
+
+  vpc_security_group_ids = [var.security_group_id]
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  skip_final_snapshot    = var.env == "staging"
+  backup_retention_period = var.env == "prod" ? 7 : 1
+  tags = { Name = "Environment-${var.env}-RDS" }
+}
+
+output "endpoint" { value = aws_db_instance.main.endpoint }
+output "db_name" { value = aws_db_instance.main.db_name }
+output "username" { value = aws_db_instance.main.username }
+output "password" { value = nonsensitive(random_password.db.result) }
+EOF
+
+cat <<'EOF' > terraform/rds/variables.tf
+variable "project" {}
+variable "env" {}
+variable "db_name" {}
+variable "username" {}
+variable "subnet_ids" { type = list(string) }
+variable "security_group_id" {}
+EOF
+
+# Redis module
+cat <<'EOF' > terraform/redis/main.tf
+resource "aws_elasticache_subnet_group" "main" {
+  name       = "${var.project}-${var.env}-redis"
+  subnet_ids = var.subnet_ids
+}
+
+resource "aws_elasticache_replication_group" "main" {
+  replication_group_id       = "${var.project}-${var.env}-redis"
+  description                = "Redis cache"
+  port                       = 6379
+  parameter_group_name       = "default.redis7"
+  node_type                  = "cache.t3.micro"
+  num_cache_nodes            = 1
+  subnet_group_name          = aws_elasticache_subnet_group.main.name
+  security_group_ids         = [var.security_group_id]
+  tags = { Name = "Environment-${var.env}-Redis" }
+}
+
+output "redis_url" {
+  value = "redis://${aws_elasticache_replication_group.main.cache_nodes.0.address}:6379"
+}
+EOF
+
+cat <<'EOF' > terraform/redis/variables.tf
+variable "project" {}
+variable "env" {}
+variable "subnet_ids" { type = list(string) }
+variable "security_group_id" {}
+EOF
+
+# ECR module
+cat <<'EOF' > terraform/ecr/main.tf
+resource "aws_ecr_repository" "backend" {
+  name                 = "${var.project}-${var.env}-backend"
+  image_tag_mutability = "MUTABLE"
+  tags = { Name = "Environment-${var.env}-BackendECR" }
+}
+
+resource "aws_ecr_repository" "frontend {
+  name                 = "${var.project}-${var.env}-frontend"
+  image_tag_mutability = "MUTABLE"
+  tags = { Name = "Environment-${var.env}-FrontendECR" }
+}
+
+output "backend_repo_url" { value = aws_ecr_repository.backend.repository_url }
+output "frontend_repo_url" { value = aws_ecr_repository.frontend.repository_url }
+EOF
+
+cat <<'EOF' > terraform/ecr/variables.tf
+variable "project" {}
+variable "env" {}
+EOF
+
+# CloudWatch module
+cat <<'EOF' > terraform/cloudwatch/main.tf
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ecs/${var.project}-${var.env}"
+  retention_in_days = var.env == "prod" ? 30 : 3
+  tags = { Name = "Environment-${var.env}-LogGroup" }
+}
+output "log_group" { value = aws_cloudwatch_log_group.app.name }
+EOF
+
+cat <<'EOF' > terraform/cloudwatch/variables.tf
+variable "project" {}
+variable "env" {}
+EOF
+
+# Secrets Manager module
+cat <<'EOF' > terraform/secrets_manager/main.tf
+resource "aws_secretsmanager_secret" "django" {
+  name = "${var.project}-${var.env}-django-secrets"
+  tags = { Name = "Environment-${var.env}-DjangoSecrets" }
+}
+
+resource "aws_secretsmanager_secret_version" "django" {
+  secret_id     = aws_secretsmanager_secret.django.id
+  secret_string = jsonencode({})
+}
+
+resource "aws_secretsmanager_secret" "s3" {
+  name = "${var.project}-${var.env}-s3-keys"
+  tags = { Name = "Environment-${var.env}-S3Keys" }
+}
+
+resource "aws_secretsmanager_secret_version" "s3" {
+  secret_id     = aws_secretsmanager_secret.s3.id
+  secret_string = jsonencode({})
+}
+
+output "django_secret_arn" { value = aws_secretsmanager_secret.django.arn }
+output "s3_secret_arn" { value = aws_secretsmanager_secret.s3.arn }
+EOF
+
+cat <<'EOF' > terraform/secrets_manager/variables.tf
+variable "project" {}
+variable "env" {}
+EOF
+
+# ECS module
+cat <<'EOF' > terraform/ecs/main.tf
+resource "aws_iam_role" "task_execution" {
+  name = "${var.project}-${var.env}-task-exec-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+  managed_policy_arns = ["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"]
+}
+
+resource "aws_ecs_cluster" "main" {
+  name = "${var.project}-${var.env}-cluster"
+  tags = { Name = "Environment-${var.env}-ECSCluster" }
+}
+
+resource "aws_ecs_task_definition" "backend" {
+  family                   = "${var.project}-${var.env}-backend-task"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = 256
+  memory                   = 512
+  execution_role_arn       = aws_iam_role.task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name  = "backend"
+      image = "${var.backend_ecr_repo_url}:latest"
+      cpu   = 256
+      memory = 512
+      essential = true
+      portMappings = [{ containerPort = 8000, protocol = "tcp" }]
+      environment = [
+        { name = "ENVIRONMENT", value = var.env },
+        { name = "DB_HOST", value = var.db_host },
+        { name = "DB_NAME", value = var.db_name },
+        { name = "DB_USER", value = var.db_user },
+        { name = "REDIS_URL", value = var.redis_url }
+      ]
+      secrets = [
+        { name = "DB_PASSWORD", valueFrom = "${var.db_secret_arn}:DB_PASS::" },
+        { name = "SECRET_KEY", valueFrom = "${var.django_secret_arn}:SECRET_KEY::" }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = var.log_group
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "backend"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_service" "backend" {
+  name            = "${var.project}-${var.env}-backend-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.backend.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.private_subnets
+    security_groups  = [var.ecs_sg_id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_alb_target_group.backend.arn
+    container_name   = "backend"
+    container_port   = 8000
+  }
+  depends_on = [aws_alb_listener.https]
+}
+
+resource "aws_lb" "main" {
+  name               = "${var.project}-${var.env}-alb"
+  load_balancer_type = "application"
+  subnets            = var.public_subnets
+  security_groups    = [var.alb_sg_id]
+  tags = { Name = "Environment-${var.env}-ALB" }
+}
+
+resource "aws_alb_target_group" "backend" {
+  name     = "${var.project}-${var.env}-backend-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = var.vpc_id
+  target_type = "ip"
+
+  health_check {
+    path            = "/health/"
+    healthy_threshold = 2
+  }
+}
+
+resource "aws_alb_listener" "https" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS-1-2-2017-01"
+  certificate_arn   = var.certificate_arn
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_alb_target_group.backend.arn
+  }
+}
+resource "aws_alb_listener" "redirect_http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "80"
+  protocol          = "HTTP"
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+output "alb_dns" { value = aws_lb.main.dns_name }
+EOF
+
+cat <<'EOF' > terraform/ecs/variables.tf
+variable "project" {}
+variable "env" {}
+variable "vpc_id" {}
+variable "public_subnets" { type = list(string) }
+variable "private_subnets" { type = list(string) }
+variable "ecs_sg_id" {}
+variable "alb_sg_id" {}
+variable "log_group" {}
+variable "backend_ecr_repo_url" {}
+variable "certificate_arn" {}
+variable "db_host" {}
+variable "db_name" {}
+variable "db_user" {}
+variable "redis_url" {}
+variable "region" {}
+variable "db_secret_arn" {}
+variable "django_secret_arn" {}
+EOF
+
+# Root outputs.tf
+cat <<'EOF' > terraform/outputs.tf
+output "alb_dns" { value = module.ecs.alb_dns }
+output "db_host" { value = module.rds.endpoint }
+output "db_name" { value = module.rds.db_name }
+output "db_user" { value = module.rds.username }
+output "db_pass" { value = module.rds.password }
+output "redis_url" { value = module.redis.redis_url }
+output "ecr_backend_url" { value = module.ecr.backend_repo_url }
+output "ecr_frontend_url" { value = module.ecr.frontend_repo_url }
+EOF
+
+# versions.tf auths above
+cat <<'EOF' > terraform/main.tf
+locals {
+  project = "captive-portal"
+}
+
+module "vpc" {
+  source = "./vpc"
+  project = local.project
+  env     = var.environment
+  cidr    = var.cidr
+  azs     = var.azs
+}
+
+module "rds" {
+  source            = "./rds"
+  project           = local.project
+  env               = var.environment
+  db_name           = local.project
+  username          = var.db_username
+  subnet_ids        = module.vpc.private_subnets
+  security_group_id = module.vpc.rds_sg_id
+}
+
+module "redis" {
+  source             = "./redis"
+  project           = local.project
+  env               = var.environment
+  subnet_ids        = module.vpc.private_subnets
+  security_group_id = module.vpc.redis_sg_id
+}
+
+module "ecr" {
+  source = "./ecr"
+  project = local.project
+  env     = var.environment
+}
+
+module "cloudwatch" {
+  source = "./cloudwatch"
+  project = local.project
+  env     = var.environment
+}
+
+module "secrets_manager" {
+  source = "./secrets_manager"
+  project = local.project
+  env     = var.environment
+}
+
+module "ecs" {
+  source             = "./ecs"
+  project            = local.project
+  env                = var.environment
+  vpc_id             = module.vpc.vpc_id
+  public_subnets     = module.vpc.public_subnets
+  private_subnets    = module.vpc.private_subnets
+  ecs_sg_id          = module.vpc.ecs_sg_id
+  alb_sg_id          = module.vpc.alb_sg_id
+  log_group          = module.cloudwatch.log_group
+  backend_ecr_repo_url = module.ecr.backend_repo_url
+  certificate_arn    = var.certificate_arn
+  db_host            = module.rds.endpoint
+  db_name            = module.rds.db_name
+  db_user            = module.rds.username
+  redis_url          = module.redis.redis_url
+  region             = var.region
+  db_secret_arn      = module.secrets_manager.db_secret_arn
+  django_secret_arn  = module.secrets_manager.django_secret_arn
+}
+EOF
+
+# .tfvars
+cat <<'EOF' > terraform/environments/staging.tfvars
+environment = "staging"
+cidr = "10.0.0.0/16"
+certificate_arn = "arn:aws:acm:us-east-1:CHANGEME:certificate/CHANGEME"
+EOF
+
+cat <<'EOF' > terraform/environments/production.tfvars
+environment = "prod"
+cidr = "10.1.0.0/16"
+certificate_arn = "arn:aws:acm:us-east-1:CHANGEME:certificate/CHANGEME"
+EOF
+
+# GitHub Actions staging
+cat <<'EOF' > .github/workflows/staging.yml
+name: Deploy Staging
+on:
+  push:
+    branches: [main]
+    paths:
+      - backend/**
+      - frontend/**
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_BACKEND: CHANGEME.dkr.ecr.us-east-1.amazonaws.com/captive-portal-staging-backend
+  ECR_FRONTEND: CHANGEME.dkr.ecr.us-east-1.amazonaws.com/captive-portal-staging-frontend
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push backend
+        run: |
+          docker build -f backend/Dockerfile -t $ECR_BACKEND:staging-$GITHUB_SHA backend
+          docker push $ECR_BACKEND:staging-$GITHUB_SHA
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+          docker build -t $ECR_FRONTEND:staging-$GITHUB_SHA frontend
+          docker push $ECR_FRONTEND:staging-$GITHUB_SHA
+
+  deploy:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy staging
+        run: |
+          terraform -chdir=terraform workspace select staging || terraform -chdir=terraform workspace new staging
+          terraform -chdir=terraform plan -var-file=environments/staging.tfvars -out=tfplan
+          terraform -chdir=terraform apply tfplan
+EOF
+
+# GitHub Actions production
+cat <<'EOF' > .github/workflows/production.yml
+name: Deploy Production
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to deploy' 
+        required: true
+
+env:
+  AWS_REGION: us-east-1
+  ECR_BACKEND: CHANGEME.dkr.ecr.us-east-1.amazonaws.com/captive-portal-prod-backend
+  ECR_FRONTEND: CHANGEME.dkr.ecr.us-east-1.amazonaws.com/captive-portal-prod-frontend
+
+jobs:
+  build-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push backend
+        run: |
+          docker build -f backend/Dockerfile -t $ECR_BACKEND:${{ github.event.inputs.tag }} backend
+          docker push $ECR_BACKEND:${{ github.event.inputs.tag }}
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+          docker build -t $ECR_FRONTEND:${{ github.event.inputs.tag }} frontend
+          docker push $ECR_FRONTEND:${{ github.event.inputs.tag }}
+
+  deploy:
+    needs: [build-backend, build-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy production
+        run: |
+          terraform -chdir=terraform workspace select production || terraform -chdir=terraform workspace new production
+          terraform -chdir=terraform plan -var-file=environments/production.tfvars -out=tfplan
+          terraform -chdir=terraform apply tfplan
+EOF
+
+# README
+cat <<'EOF' > terraform/README.md
+# AWS Infrastructure for Captive-Portal
+
+## Rollback / Destroy Order
+In case of emergency, destroy resources in this order:
